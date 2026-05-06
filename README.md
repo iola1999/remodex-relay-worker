@@ -11,3 +11,5 @@ https://github.com/Emanuele-web04/remodex/tree/main/relay
 This version keeps the relay behavior but adapts the runtime to Cloudflare Workers and Durable Objects.
 
 Implementation notes: [docs/ADAPTATION.md](docs/ADAPTATION.md)
+
+Structured comparison with the original relay: https://github.com/iola1999/remodex-relay-worker/pull/3
