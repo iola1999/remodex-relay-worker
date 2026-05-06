@@ -5,8 +5,8 @@
   "license": "Apache-2.0",
   "type": "module",
   "scripts": {
-    "build": "esbuild src/index.mjs --bundle --format=esm --target=es2022 --outfile=dist/worker.mjs --external:cloudflare:workers",
-    "check": "node --check src/index.mjs",
+    "build": "esbuild index.mjs --bundle --format=esm --target=es2022 --outfile=dist/worker.mjs --external:cloudflare:workers",
+    "check": "node --check index.mjs && node --check relay.js && node --check server.js && node --check push-service.js && node --check apns-client.js && node --check shared.js",
     "dev": "wrangler dev",
     "deploy": "npm run build && wrangler deploy",
     "deploy:dry-run": "npm run build && wrangler deploy --dry-run"

@@ -1,6 +1,12 @@
 # Worker Adaptation Notes
 
-This package was derived from the Remodex `relay/` Node runtime, but it is not a direct bundle of `server.js`.
+This package was derived from the Remodex `relay/` Node runtime, but it is not a direct bundle of `server.js`. The Worker source keeps the original relay folder shape where practical:
+
+- `relay.js` contains the per-session WebSocket relay Durable Object.
+- `server.js` contains the Worker fetch router and directory Durable Object.
+- `push-service.js` contains push registration, dedupe, and completion notification policy.
+- `apns-client.js` contains APNs token generation and delivery.
+- `index.mjs` is only the Cloudflare module entrypoint.
 
 ## What Changed
 
@@ -12,6 +18,8 @@ This package was derived from the Remodex `relay/` Node runtime, but it is not a
 - Replaced Node Ed25519 `crypto.verify()` with Web Crypto Ed25519 verification.
 - Replaced `Buffer` length-prefix helpers with `Uint8Array`/`DataView`.
 - Replaced process-level runtime health metrics with Worker-safe minimal health and DO stats.
+- Replaced file-backed push state with Durable Object storage.
+- Replaced APNs `http2` calls with Worker `fetch()` and Web Crypto ES256 JWT signing.
 - Kept relay session identifiers out of logs by logging only a short SHA-256 hash label.
 
 ## What Is Preserved
@@ -27,14 +35,15 @@ This package was derived from the Remodex `relay/` Node runtime, but it is not a
 - Short manual pairing-code resolution.
 - Trusted-session resolution with timestamp skew check, nonce replay protection, trusted-phone matching, and Ed25519 signature verification.
 - Default disabled push endpoints.
+- Push registration and completion notification endpoints when `REMODEX_ENABLE_PUSH_SERVICE=true`.
 
 ## What Is Not Included
 
-- APNs delivery.
-- File-backed push session persistence.
 - Node `http2`.
 - Node `fs`, `os`, `path`, or process memory/event-loop health.
 - Any hosted production domain in the Remodex app repo.
+
+APNs delivery is implemented through Worker `fetch()` rather than Node `http2`; APNs credentials must be provided as Worker environment variables/secrets. `_FILE` private-key loading is intentionally not supported in Workers.
 
 ## Why Durable Objects Are Required
 
