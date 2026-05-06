@@ -1,13 +1,18 @@
 {
-  "name": "remodex-relay",
+  "name": "remodex-relay-worker",
+  "version": "0.1.0",
   "private": true,
   "license": "Apache-2.0",
-  "type": "commonjs",
+  "type": "module",
   "scripts": {
-    "start": "node ./server.js",
-    "test": "node --test ./*.test.js"
+    "build": "esbuild relay.js --bundle --format=esm --target=es2022 --outfile=dist/worker.mjs --external:cloudflare:workers",
+    "check": "node --check relay.js",
+    "dev": "wrangler dev",
+    "deploy": "npm run build && wrangler deploy",
+    "deploy:dry-run": "npm run build && wrangler deploy --dry-run"
   },
-  "dependencies": {
-    "ws": "^8.19.0"
+  "devDependencies": {
+    "esbuild": "^0.25.12",
+    "wrangler": "^4.88.0"
   }
 }

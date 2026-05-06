@@ -1,0 +1,30 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "remodex-relay-worker",
+  "main": "dist/worker.mjs",
+  "compatibility_date": "2026-05-06",
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "REMODEX_RELAY_SESSION",
+        "class_name": "RelaySession"
+      },
+      {
+        "name": "REMODEX_RELAY_DIRECTORY",
+        "class_name": "RelayDirectory"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": [
+        "RelaySession",
+        "RelayDirectory"
+      ]
+    }
+  ],
+  "observability": {
+    "enabled": true
+  }
+}
