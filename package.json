@@ -1,0 +1,13 @@
+{
+  "name": "remodex-relay",
+  "private": true,
+  "license": "Apache-2.0",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node ./server.js",
+    "test": "node --test ./*.test.js"
+  },
+  "dependencies": {
+    "ws": "^8.19.0"
+  }
+}
