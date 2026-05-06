@@ -1,695 +1,405 @@
-// FILE: relay.js
-// Purpose: Thin self-hostable WebSocket relay for Remodex pairing, trusted-session lookup, and encrypted forwarding.
-// Layer: Standalone server module
-// Exports: setupRelay, getRelayStats, hasActiveMacSession, hasAuthenticatedMacSession, resolveTrustedMacSession, resolvePairingCode
+import { DurableObject } from "cloudflare:workers";
+import {
+  CLEANUP_DELAY_MS,
+  CLOSE_CODE_IPHONE_REPLACED,
+  CLOSE_CODE_MAC_ABSENCE_BUFFER_FULL,
+  CLOSE_CODE_SESSION_UNAVAILABLE,
+  MAC_ABSENCE_GRACE_MS,
+  clientAddressKey,
+  createFixedWindowRateLimiter,
+  directoryStub,
+  isOpenSocket,
+  isRelayMobileRole,
+  json,
+  messageToText,
+  normalizeMacRegistration,
+  normalizeRelayRole,
+  readJSONBody,
+  readString,
+  relaySessionIdFromPath,
+  relaySessionLogLabel,
+  safeParseJSON,
+  secretsEqual,
+} from "./shared.js";
 
-const { createHash, createPublicKey, verify } = require("crypto");
-const { WebSocket } = require("ws");
-
-const CLEANUP_DELAY_MS = 60_000;
-const HEARTBEAT_INTERVAL_MS = 30_000;
-const CLOSE_CODE_SESSION_UNAVAILABLE = 4002;
-const CLOSE_CODE_IPHONE_REPLACED = 4003;
-const CLOSE_CODE_MAC_ABSENCE_BUFFER_FULL = 4004;
-const MAC_ABSENCE_GRACE_MS = 15_000;
-const TRUSTED_SESSION_RESOLVE_TAG = "remodex-trusted-session-resolve-v1";
-const TRUSTED_SESSION_RESOLVE_SKEW_MS = 90_000;
-const SHORT_PAIRING_CODE_MIN_LENGTH = 8;
-const SHORT_PAIRING_CODE_MAX_LENGTH = 12;
-
-// In-memory session registry for one Mac host and one live mobile client per session (iOS or Android).
-const sessions = new Map();
-const relayMetrics = {
-  startedAt: Date.now(),
-  acceptedConnections: 0,
-  closedConnections: 0,
-  heartbeatTerminations: 0,
-  macMessagesRelayed: 0,
-  mobileMessagesRelayed: 0,
-  mobileMessagesRejectedDuringMacAbsence: 0,
-};
-
-function normalizeRelayRole(headerValue) {
-  const raw = readHeaderString(headerValue);
-  return typeof raw === "string" ? raw.trim().toLowerCase() : "";
-}
-
-function isRelayMobileRole(role) {
-  return role === "iphone" || role === "android";
-}
-const liveSessionsByMacDeviceId = new Map();
-const liveSessionsByPairingCode = new Map();
-const usedResolveNonces = new Map();
-
-// Attaches relay behavior to a ws WebSocketServer instance.
-function setupRelay(
-  wss,
-  {
-    setTimeoutFn = setTimeout,
-    clearTimeoutFn = clearTimeout,
-    macAbsenceGraceMs = MAC_ABSENCE_GRACE_MS,
-  } = {}
-) {
-  const heartbeat = setInterval(() => {
-    for (const ws of wss.clients) {
-      if (ws._relayAlive === false) {
-        relayMetrics.heartbeatTerminations += 1;
-        console.warn(
-          `[relay] heartbeat terminated ${ws._relayRole || "unknown"} `
-          + `${relaySessionLogLabel(ws._relaySessionId || "")}`
-        );
-        ws.terminate();
-        continue;
-      }
-      ws._relayAlive = false;
-      ws.ping();
-    }
-  }, HEARTBEAT_INTERVAL_MS);
-  heartbeat.unref?.();
-
-  wss.on("close", () => clearInterval(heartbeat));
-
-  wss.on("connection", (ws, req) => {
-    const urlPath = req.url || "";
-    const match = urlPath.match(/^\/relay\/([^/?]+)/);
-    const sessionId = match?.[1];
-    const role = normalizeRelayRole(req.headers["x-role"]);
-    relayMetrics.acceptedConnections += 1;
-    ws._relaySessionId = sessionId;
-    ws._relayRole = role;
-
-    if (!sessionId || (role !== "mac" && !isRelayMobileRole(role))) {
-      ws.close(4000, "Missing sessionId or invalid x-role header");
-      return;
-    }
-
-    ws._relayAlive = true;
-    ws.on("pong", () => {
-      ws._relayAlive = true;
+export class RelaySession extends DurableObject {
+  constructor(ctx, env) {
+    super(ctx, env);
+    this.startedAt = Date.now();
+    this.upgradeRateLimiter = createFixedWindowRateLimiter({
+      windowMs: 60_000,
+      maxRequests: 60,
     });
+    this.metrics = {
+      acceptedConnections: 0,
+      closedConnections: 0,
+      macMessagesRelayed: 0,
+      mobileMessagesRelayed: 0,
+      mobileMessagesRejectedDuringMacAbsence: 0,
+    };
+  }
 
-    // Only the Mac host is allowed to create a fresh session room.
-    if (isRelayMobileRole(role) && !sessions.has(sessionId)) {
-      ws.close(CLOSE_CODE_SESSION_UNAVAILABLE, "Mac session not available");
-      return;
-    }
+  async fetch(request) {
+    const url = new URL(request.url);
 
-    if (!sessions.has(sessionId)) {
-      sessions.set(sessionId, {
-        mac: null,
-        macRegistration: null,
-        clients: new Set(),
-        cleanupTimer: null,
-        macAbsenceTimer: null,
-        notificationSecret: null,
+    if (request.method === "GET" && url.pathname === "/internal/session/active") {
+      return json({
+        ok: true,
+        active: await this.hasActiveMacConnection(),
       });
     }
 
-    const session = sessions.get(sessionId);
+    if (request.method === "POST" && url.pathname === "/internal/session/authenticated") {
+      const body = await readJSONBody(request);
+      return json({
+        ok: true,
+        authenticated: await this.hasAuthenticatedMacConnection(body.notificationSecret),
+      });
+    }
 
-    if (isRelayMobileRole(role) && !canAcceptMobileClientConnection(session)) {
-      ws.close(CLOSE_CODE_SESSION_UNAVAILABLE, "Mac session not available");
+    if (request.method === "GET" && url.pathname === "/internal/session/stats") {
+      return json({
+        ok: true,
+        relay: this.sessionStats(),
+      });
+    }
+
+    if (!url.pathname.startsWith("/relay/")) {
+      return json({ ok: false, error: "Not found" }, 404);
+    }
+
+    if (request.headers.get("upgrade")?.toLowerCase() !== "websocket") {
+      return json({ ok: false, error: "Expected WebSocket upgrade" }, 426, {
+        upgrade: "websocket",
+      });
+    }
+
+    if (!this.upgradeRateLimiter.allow(clientAddressKey(request))) {
+      return new Response(null, {
+        status: 429,
+        headers: { "retry-after": "60" },
+      });
+    }
+
+    const sessionId = relaySessionIdFromPath(url.pathname);
+    const role = normalizeRelayRole(request.headers.get("x-role"));
+    this.metrics.acceptedConnections += 1;
+
+    if (!sessionId || (role !== "mac" && !isRelayMobileRole(role))) {
+      const pair = new WebSocketPair();
+      const [client, server] = Object.values(pair);
+      server.accept();
+      server.close(4000, "Missing sessionId or invalid x-role header");
+      return new Response(null, { status: 101, webSocket: client });
+    }
+
+    await this.ctx.storage.put("sessionId", sessionId);
+
+    if (isRelayMobileRole(role) && !(await this.canAcceptMobileClientConnection())) {
+      const pair = new WebSocketPair();
+      const [client, server] = Object.values(pair);
+      server.accept();
+      server.close(CLOSE_CODE_SESSION_UNAVAILABLE, "Mac session not available");
+      return new Response(null, { status: 101, webSocket: client });
+    }
+
+    const pair = new WebSocketPair();
+    const [client, server] = Object.values(pair);
+    const connectionId = crypto.randomUUID();
+    server.serializeAttachment({ sessionId, role, connectionId });
+
+    if (role === "mac") {
+      await this.acceptMacSocket(server, request, sessionId, connectionId);
+    } else {
+      await this.acceptMobileSocket(server, sessionId, role, connectionId);
+    }
+
+    this.ctx.acceptWebSocket(server);
+    return new Response(null, { status: 101, webSocket: client });
+  }
+
+  async acceptMacSocket(server, request, sessionId, connectionId) {
+    const previousMacConnectionId = await this.ctx.storage.get("currentMacConnectionId");
+    const previousMac = previousMacConnectionId
+      ? this.findOpenSocket("mac", previousMacConnectionId)
+      : null;
+    if (previousMac) {
+      previousMac.close(4001, "Replaced by new Mac connection");
+    }
+
+    const previousRegistration = await this.ctx.storage.get("macRegistration");
+    if (previousRegistration?.macDeviceId) {
+      await this.unregisterDirectory(previousRegistration, sessionId);
+    }
+
+    const notificationSecret = readString(request.headers.get("x-notification-secret"));
+    const macRegistration = normalizeMacRegistration({
+      macDeviceId: readString(request.headers.get("x-mac-device-id")),
+      macIdentityPublicKey: readString(request.headers.get("x-mac-identity-public-key")),
+      displayName: readString(request.headers.get("x-machine-name")),
+      trustedPhoneDeviceId: readString(request.headers.get("x-trusted-phone-device-id")),
+      trustedPhonePublicKey: readString(request.headers.get("x-trusted-phone-public-key")),
+      pairingCode: readString(request.headers.get("x-pairing-code")),
+      pairingVersion: readString(request.headers.get("x-pairing-version")),
+      pairingExpiresAt: readString(request.headers.get("x-pairing-expires-at")),
+    }, sessionId);
+
+    await this.ctx.storage.put({
+      currentMacConnectionId: connectionId,
+      notificationSecret,
+      macRegistration,
+      macAbsentUntil: 0,
+      cleanupAfter: 0,
+    });
+    await this.ctx.storage.deleteAlarm();
+    await this.registerDirectory(macRegistration);
+    console.log(`[relay] Mac connected -> ${await relaySessionLogLabel(sessionId)}`);
+  }
+
+  async acceptMobileSocket(server, sessionId, role, connectionId) {
+    for (const socket of this.mobileSockets()) {
+      socket.close(CLOSE_CODE_IPHONE_REPLACED, "Replaced by newer mobile connection");
+    }
+    server.serializeAttachment({ sessionId, role, connectionId });
+    await this.ctx.storage.put("cleanupAfter", 0);
+    console.log(`[relay] Mobile connected (${role}) -> ${await relaySessionLogLabel(sessionId)}`);
+  }
+
+  async webSocketMessage(ws, message) {
+    const attachment = ws.deserializeAttachment() || {};
+    const role = normalizeRelayRole(attachment.role);
+    const sessionId = readString(attachment.sessionId)
+      || await this.ctx.storage.get("sessionId")
+      || "";
+
+    if (role === "mac") {
+      if (await this.applyMacRegistrationMessage(sessionId, message)) {
+        return;
+      }
+      for (const client of this.mobileSockets()) {
+        if (isOpenSocket(client)) {
+          this.metrics.macMessagesRelayed += 1;
+          client.send(message);
+        }
+      }
       return;
     }
 
-    if (session.cleanupTimer) {
-      clearTimeoutFn(session.cleanupTimer);
-      session.cleanupTimer = null;
+    const currentMacConnectionId = await this.ctx.storage.get("currentMacConnectionId");
+    const mac = currentMacConnectionId ? this.findOpenSocket("mac", currentMacConnectionId) : null;
+    if (mac) {
+      this.metrics.mobileMessagesRelayed += 1;
+      mac.send(message);
+      return;
     }
+
+    this.metrics.mobileMessagesRejectedDuringMacAbsence += 1;
+    ws.close(CLOSE_CODE_MAC_ABSENCE_BUFFER_FULL, "Mac temporarily unavailable");
+  }
+
+  async webSocketClose(ws) {
+    this.metrics.closedConnections += 1;
+    const attachment = ws.deserializeAttachment() || {};
+    const role = normalizeRelayRole(attachment.role);
+    const sessionId = readString(attachment.sessionId)
+      || await this.ctx.storage.get("sessionId")
+      || "";
 
     if (role === "mac") {
-      clearMacAbsenceTimer(session, { clearTimeoutFn });
-      // The relay keeps a per-session push secret so first-time device registration
-      // cannot be claimed by someone who only knows the session id.
-      session.notificationSecret = readHeaderString(req.headers["x-notification-secret"]);
-      session.macRegistration = readMacRegistrationHeaders(req.headers, sessionId);
-      if (session.mac && session.mac.readyState === WebSocket.OPEN) {
-        session.mac.close(4001, "Replaced by new Mac connection");
-      }
-      session.mac = ws;
-      registerLiveMacSession(session.macRegistration);
-      console.log(`[relay] Mac connected -> ${relaySessionLogLabel(sessionId)}`);
-    } else {
-      // Keep one live mobile RPC client per session to avoid competing sockets.
-      for (const existingClient of session.clients) {
-        if (existingClient === ws) {
-          continue;
-        }
-        if (
-          existingClient.readyState === WebSocket.OPEN
-          || existingClient.readyState === WebSocket.CONNECTING
-        ) {
-          existingClient.close(
-            CLOSE_CODE_IPHONE_REPLACED,
-            "Replaced by newer mobile connection"
-          );
-        }
-        session.clients.delete(existingClient);
-      }
-
-      session.clients.add(ws);
-      console.log(
-        `[relay] Mobile connected (${role}) -> ${relaySessionLogLabel(sessionId)} `
-        + `(${session.clients.size} client(s))`
-      );
-    }
-
-    ws.on("message", (data) => {
-      const msg = typeof data === "string" ? data : data.toString("utf-8");
-      if (role === "mac" && applyMacRegistrationMessage(session, sessionId, msg)) {
+      const currentMacConnectionId = await this.ctx.storage.get("currentMacConnectionId");
+      if (currentMacConnectionId !== attachment.connectionId) {
         return;
       }
 
-      if (role === "mac") {
-        for (const client of session.clients) {
-          if (client.readyState === WebSocket.OPEN) {
-            relayMetrics.macMessagesRelayed += 1;
-            client.send(msg);
-          }
-        }
-      } else if (session.mac?.readyState === WebSocket.OPEN) {
-        relayMetrics.mobileMessagesRelayed += 1;
-        session.mac.send(msg);
-      } else {
-        // The relay cannot prove a buffered request really reached the bridge after
-        // a reconnect, so fail fast with an explicit retry-required close instead
-        // of silently dropping queued client work during a later flush.
-        relayMetrics.mobileMessagesRejectedDuringMacAbsence += 1;
-        ws.close(CLOSE_CODE_MAC_ABSENCE_BUFFER_FULL, "Mac temporarily unavailable");
-      }
-    });
-
-    ws.on("close", () => {
-      relayMetrics.closedConnections += 1;
-      if (role === "mac") {
-        if (session.mac === ws) {
-          session.mac = null;
-          unregisterLiveMacSession(session.macRegistration, sessionId);
-          console.log(`[relay] Mac disconnected -> ${relaySessionLogLabel(sessionId)}`);
-          if (session.clients.size > 0) {
-            scheduleMacAbsenceTimeout(sessionId, {
-              macAbsenceGraceMs,
-              setTimeoutFn,
-              clearTimeoutFn,
-            });
-          } else {
-            scheduleCleanup(sessionId, { setTimeoutFn });
-          }
-        }
-      } else {
-        session.clients.delete(ws);
-        console.log(
-          `[relay] Mobile disconnected (${role}) -> ${relaySessionLogLabel(sessionId)} `
-          + `(${session.clients.size} remaining)`
-        );
-      }
-      scheduleCleanup(sessionId, { setTimeoutFn });
-    });
-
-    ws.on("error", (err) => {
-      console.error(
-        `[relay] WebSocket error (${role}, ${relaySessionLogLabel(sessionId)}):`,
-        err.message
-      );
-    });
-  });
-}
-
-function scheduleCleanup(sessionId, { setTimeoutFn = setTimeout } = {}) {
-  const session = sessions.get(sessionId);
-  if (!session) {
-    return;
-  }
-  if (session.mac || session.clients.size > 0 || session.cleanupTimer || session.macAbsenceTimer) {
-    return;
-  }
-
-  session.cleanupTimer = setTimeoutFn(() => {
-    const activeSession = sessions.get(sessionId);
-    if (
-      activeSession
-      && !activeSession.mac
-      && activeSession.clients.size === 0
-      && !activeSession.macAbsenceTimer
-    ) {
-      unregisterLiveMacSession(activeSession.macRegistration, sessionId);
-      sessions.delete(sessionId);
-      console.log(`[relay] ${relaySessionLogLabel(sessionId)} cleaned up`);
-    }
-  }, CLEANUP_DELAY_MS);
-  session.cleanupTimer.unref?.();
-}
-
-function scheduleMacAbsenceTimeout(
-  sessionId,
-  {
-    macAbsenceGraceMs,
-    setTimeoutFn = setTimeout,
-    clearTimeoutFn = clearTimeout,
-  } = {}
-) {
-  const session = sessions.get(sessionId);
-  if (!session || session.mac || session.macAbsenceTimer) {
-    return;
-  }
-
-  session.macAbsenceTimer = setTimeoutFn(() => {
-    const activeSession = sessions.get(sessionId);
-    if (!activeSession) {
+      const registration = await this.ctx.storage.get("macRegistration");
+      await this.unregisterDirectory(registration, sessionId);
+      await this.ctx.storage.put({
+        currentMacConnectionId: "",
+        macAbsentUntil: Date.now() + MAC_ABSENCE_GRACE_MS,
+      });
+      await this.ctx.storage.setAlarm(Date.now() + MAC_ABSENCE_GRACE_MS);
+      console.log(`[relay] Mac disconnected -> ${await relaySessionLogLabel(sessionId)}`);
       return;
     }
 
-    activeSession.macAbsenceTimer = null;
-    activeSession.notificationSecret = null;
-    unregisterLiveMacSession(activeSession.macRegistration, sessionId);
-    closeSessionClients(activeSession, CLOSE_CODE_SESSION_UNAVAILABLE, "Mac disconnected");
-    scheduleCleanup(sessionId, { setTimeoutFn });
-  }, macAbsenceGraceMs);
-  session.macAbsenceTimer.unref?.();
-
-  if (session.cleanupTimer) {
-    clearTimeoutFn(session.cleanupTimer);
-    session.cleanupTimer = null;
-  }
-}
-
-function clearMacAbsenceTimer(session, { clearTimeoutFn = clearTimeout } = {}) {
-  if (!session?.macAbsenceTimer) {
-    return;
+    console.log(`[relay] Mobile disconnected (${role}) -> ${await relaySessionLogLabel(sessionId)}`);
+    if (!this.hasAnyOpenSocket()) {
+      await this.scheduleCleanup();
+    }
   }
 
-  clearTimeoutFn(session.macAbsenceTimer);
-  session.macAbsenceTimer = null;
-}
-
-function canAcceptMobileClientConnection(session) {
-  if (!session) {
-    return false;
+  async webSocketError(ws, error) {
+    const attachment = ws.deserializeAttachment() || {};
+    console.error(
+      `[relay] WebSocket error (${normalizeRelayRole(attachment.role) || "unknown"}, `
+      + `${await relaySessionLogLabel(attachment.sessionId || "")}): ${error?.message || error}`
+    );
   }
 
-  if (session.mac?.readyState === WebSocket.OPEN) {
+  async alarm() {
+    const currentMacConnectionId = await this.ctx.storage.get("currentMacConnectionId");
+    if (currentMacConnectionId && this.findOpenSocket("mac", currentMacConnectionId)) {
+      return;
+    }
+
+    const macAbsentUntil = Number(await this.ctx.storage.get("macAbsentUntil") || 0);
+    if (macAbsentUntil && Date.now() >= macAbsentUntil) {
+      for (const client of this.mobileSockets()) {
+        client.close(CLOSE_CODE_SESSION_UNAVAILABLE, "Mac disconnected");
+      }
+      await this.ctx.storage.put({
+        notificationSecret: "",
+        macAbsentUntil: 0,
+      });
+    }
+
+    if (!this.hasAnyOpenSocket()) {
+      const cleanupAfter = Number(await this.ctx.storage.get("cleanupAfter") || 0);
+      if (cleanupAfter && Date.now() >= cleanupAfter) {
+        await this.ctx.storage.deleteAll();
+      }
+    }
+  }
+
+  async hasActiveMacConnection() {
+    const currentMacConnectionId = await this.ctx.storage.get("currentMacConnectionId");
+    return Boolean(currentMacConnectionId && this.findOpenSocket("mac", currentMacConnectionId));
+  }
+
+  async hasAuthenticatedMacConnection(notificationSecret) {
+    if (!await this.hasActiveMacConnection()) {
+      return false;
+    }
+    const storedSecret = await this.ctx.storage.get("notificationSecret");
+    return secretsEqual(storedSecret, notificationSecret);
+  }
+
+  async canAcceptMobileClientConnection() {
+    if (await this.hasActiveMacConnection()) {
+      return true;
+    }
+
+    const macAbsentUntil = Number(await this.ctx.storage.get("macAbsentUntil") || 0);
+    return Boolean(macAbsentUntil && Date.now() < macAbsentUntil);
+  }
+
+  async applyMacRegistrationMessage(sessionId, rawMessage) {
+    const rawText = messageToText(rawMessage);
+    if (!rawText) {
+      return false;
+    }
+
+    const parsed = safeParseJSON(rawText);
+    if (parsed?.kind !== "relayMacRegistration" || typeof parsed.registration !== "object") {
+      return false;
+    }
+
+    const previousRegistration = await this.ctx.storage.get("macRegistration");
+    if (previousRegistration?.macDeviceId) {
+      await this.unregisterDirectory(previousRegistration, sessionId);
+    }
+
+    const macRegistration = normalizeMacRegistration(parsed.registration, sessionId);
+    await this.ctx.storage.put("macRegistration", macRegistration);
+    await this.registerDirectory(macRegistration);
     return true;
   }
 
-  // Lets the phone rejoin the same relay session while the Mac is still inside
-  // the temporary-absence grace window instead of forcing a full disconnect flow.
-  return Boolean(session.macAbsenceTimer);
-}
-
-function closeSessionClients(session, code, reason) {
-  for (const client of session.clients) {
-    if (client.readyState === WebSocket.OPEN || client.readyState === WebSocket.CONNECTING) {
-      client.close(code, reason);
+  async registerDirectory(registration) {
+    if (!registration?.macDeviceId) {
+      return;
+    }
+    const response = await directoryStub(this.env).fetch(new Request(
+      "https://remodex.internal/internal/directory/register",
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(registration),
+      }
+    ));
+    if (!response.ok) {
+      console.error(`[relay] directory registration failed: ${response.status}`);
     }
   }
-}
 
-function relaySessionLogLabel(sessionId) {
-  const normalizedSessionId = typeof sessionId === "string" ? sessionId.trim() : "";
-  if (!normalizedSessionId) {
-    return "session=[redacted]";
-  }
-
-  const digest = createHash("sha256")
-    .update(normalizedSessionId)
-    .digest("hex")
-    .slice(0, 8);
-  return `session#${digest}`;
-}
-
-// Resolves the current live relay session for a previously trusted Mac without exposing the session id publicly.
-function resolveTrustedMacSession({
-  macDeviceId,
-  phoneDeviceId,
-  phoneIdentityPublicKey,
-  timestamp,
-  nonce,
-  signature,
-  now = Date.now(),
-} = {}) {
-  const normalizedMacDeviceId = normalizeNonEmptyString(macDeviceId);
-  const normalizedPhoneDeviceId = normalizeNonEmptyString(phoneDeviceId);
-  const normalizedPhoneIdentityPublicKey = normalizeNonEmptyString(phoneIdentityPublicKey);
-  const normalizedNonce = normalizeNonEmptyString(nonce);
-  const normalizedSignature = normalizeNonEmptyString(signature);
-  const normalizedTimestamp = Number(timestamp);
-
-  if (
-    !normalizedMacDeviceId
-    || !normalizedPhoneDeviceId
-    || !normalizedPhoneIdentityPublicKey
-    || !normalizedNonce
-    || !normalizedSignature
-    || !Number.isFinite(normalizedTimestamp)
-  ) {
-    throw createRelayError(400, "invalid_request", "The trusted-session resolve request is missing required fields.");
-  }
-
-  if (Math.abs(now - normalizedTimestamp) > TRUSTED_SESSION_RESOLVE_SKEW_MS) {
-    throw createRelayError(401, "resolve_request_expired", "This trusted-session resolve request has expired.");
-  }
-
-  pruneUsedResolveNonces(now);
-  const nonceKey = `${normalizedMacDeviceId}|${normalizedPhoneDeviceId}|${normalizedNonce}`;
-  if (usedResolveNonces.has(nonceKey)) {
-    throw createRelayError(409, "resolve_request_replayed", "This trusted-session resolve request was already used.");
-  }
-
-  const liveSession = liveSessionsByMacDeviceId.get(normalizedMacDeviceId);
-  if (!liveSession || !hasActiveMacSession(liveSession.sessionId)) {
-    throw createRelayError(404, "session_unavailable", "The trusted Mac is offline right now.");
-  }
-
-  if (
-    liveSession.trustedPhoneDeviceId !== normalizedPhoneDeviceId
-    || liveSession.trustedPhonePublicKey !== normalizedPhoneIdentityPublicKey
-  ) {
-    throw createRelayError(403, "phone_not_trusted", "This iPhone is not trusted for the requested Mac.");
-  }
-
-  const transcriptBytes = buildTrustedSessionResolveBytes({
-    macDeviceId: normalizedMacDeviceId,
-    phoneDeviceId: normalizedPhoneDeviceId,
-    phoneIdentityPublicKey: normalizedPhoneIdentityPublicKey,
-    nonce: normalizedNonce,
-    timestamp: normalizedTimestamp,
-  });
-  if (!verifyTrustedSessionResolveSignature(
-    normalizedPhoneIdentityPublicKey,
-    transcriptBytes,
-    normalizedSignature
-  )) {
-    throw createRelayError(403, "invalid_signature", "The trusted-session resolve signature is invalid.");
-  }
-
-  usedResolveNonces.set(nonceKey, now + TRUSTED_SESSION_RESOLVE_SKEW_MS);
-  return {
-    ok: true,
-    macDeviceId: normalizedMacDeviceId,
-    macIdentityPublicKey: liveSession.macIdentityPublicKey,
-    displayName: liveSession.displayName || null,
-    sessionId: liveSession.sessionId,
-  };
-}
-
-// Resolves the bootstrap metadata behind a short-lived manual pairing code.
-function resolvePairingCode({
-  code,
-  now = Date.now(),
-} = {}) {
-  const normalizedCode = normalizeShortPairingCode(code);
-  if (!normalizedCode) {
-    throw createRelayError(400, "invalid_request", "The pairing code is missing or malformed.");
-  }
-
-  const registration = liveSessionsByPairingCode.get(normalizedCode);
-  if (!registration || !hasActiveMacSession(registration.sessionId)) {
-    throw createRelayError(404, "pairing_code_unavailable", "This pairing code is unavailable.");
-  }
-
-  if (!Number.isFinite(registration.pairingExpiresAt) || now > registration.pairingExpiresAt) {
-    liveSessionsByPairingCode.delete(normalizedCode);
-    throw createRelayError(410, "pairing_code_expired", "This pairing code has expired.");
-  }
-
-  if (
-    !registration.macDeviceId
-    || !registration.macIdentityPublicKey
-    || !Number.isFinite(registration.pairingVersion)
-  ) {
-    throw createRelayError(409, "pairing_code_incomplete", "The bridge pairing metadata is incomplete.");
-  }
-
-  return {
-    ok: true,
-    v: registration.pairingVersion,
-    sessionId: registration.sessionId,
-    macDeviceId: registration.macDeviceId,
-    macIdentityPublicKey: registration.macIdentityPublicKey,
-    expiresAt: registration.pairingExpiresAt,
-  };
-}
-
-// Exposes lightweight runtime stats for health/status endpoints.
-function getRelayStats() {
-  let totalClients = 0;
-  let sessionsWithMac = 0;
-  let sessionsWithOpenMac = 0;
-  let sessionsWithStaleMac = 0;
-  let sessionsWithClients = 0;
-  let cleanupPending = 0;
-  let macAbsencePending = 0;
-
-  for (const session of sessions.values()) {
-    totalClients += session.clients.size;
-    if (session.clients.size > 0) {
-      sessionsWithClients += 1;
+  async unregisterDirectory(registration, sessionId) {
+    if (!registration?.macDeviceId) {
+      return;
     }
-    if (session.mac) {
-      sessionsWithMac += 1;
-      if (session.mac.readyState === WebSocket.OPEN) {
-        sessionsWithOpenMac += 1;
-      } else {
-        sessionsWithStaleMac += 1;
+    await directoryStub(this.env).fetch(new Request(
+      "https://remodex.internal/internal/directory/unregister",
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          macDeviceId: registration.macDeviceId,
+          pairingCode: registration.pairingCode || "",
+          sessionId,
+        }),
+      }
+    ));
+  }
+
+  findOpenSocket(role, connectionId) {
+    for (const socket of this.ctx.getWebSockets()) {
+      const attachment = socket.deserializeAttachment() || {};
+      if (
+        attachment.role === role
+        && attachment.connectionId === connectionId
+        && isOpenSocket(socket)
+      ) {
+        return socket;
       }
     }
-    if (session.cleanupTimer) {
-      cleanupPending += 1;
-    }
-    if (session.macAbsenceTimer) {
-      macAbsencePending += 1;
-    }
-  }
-
-  return {
-    activeSessions: sessions.size,
-    sessionsWithMac,
-    sessionsWithOpenMac,
-    sessionsWithStaleMac,
-    sessionsWithClients,
-    totalClients,
-    pairingCodes: liveSessionsByPairingCode.size,
-    cleanupPending,
-    macAbsencePending,
-    uptimeSeconds: Math.round((Date.now() - relayMetrics.startedAt) / 1000),
-    acceptedConnections: relayMetrics.acceptedConnections,
-    closedConnections: relayMetrics.closedConnections,
-    heartbeatTerminations: relayMetrics.heartbeatTerminations,
-    macMessagesRelayed: relayMetrics.macMessagesRelayed,
-    mobileMessagesRelayed: relayMetrics.mobileMessagesRelayed,
-    mobileMessagesRejectedDuringMacAbsence: relayMetrics.mobileMessagesRejectedDuringMacAbsence,
-  };
-}
-
-// Lets the push-registration side verify that a session still belongs to a live Mac bridge.
-function hasActiveMacSession(sessionId) {
-  if (typeof sessionId !== "string" || !sessionId.trim()) {
-    return false;
-  }
-
-  const session = sessions.get(sessionId.trim());
-  return Boolean(session?.mac && session.mac.readyState === WebSocket.OPEN);
-}
-
-// Used by: relay/server.js push registration gate.
-function hasAuthenticatedMacSession(sessionId, notificationSecret) {
-  if (!hasActiveMacSession(sessionId)) {
-    return false;
-  }
-
-  const session = sessions.get(sessionId.trim());
-  return session?.notificationSecret === readHeaderString(notificationSecret);
-}
-
-function registerLiveMacSession(macRegistration) {
-  if (!macRegistration?.macDeviceId) {
-    return;
-  }
-  liveSessionsByMacDeviceId.set(macRegistration.macDeviceId, macRegistration);
-  if (macRegistration.pairingCode && Number.isFinite(macRegistration.pairingExpiresAt)) {
-    liveSessionsByPairingCode.set(macRegistration.pairingCode, macRegistration);
-  }
-}
-
-function applyMacRegistrationMessage(session, sessionId, rawMessage) {
-  const parsed = safeParseJSON(rawMessage);
-  if (parsed?.kind !== "relayMacRegistration" || typeof parsed.registration !== "object") {
-    return false;
-  }
-
-  unregisterLiveMacSession(session.macRegistration, sessionId);
-  session.macRegistration = normalizeMacRegistration(parsed.registration, sessionId);
-  registerLiveMacSession(session.macRegistration);
-  return true;
-}
-
-function unregisterLiveMacSession(macRegistration, sessionId) {
-  const macDeviceId = macRegistration?.macDeviceId;
-  if (!macDeviceId) {
-    return;
-  }
-
-  const existing = liveSessionsByMacDeviceId.get(macDeviceId);
-  if (existing?.sessionId === sessionId) {
-    liveSessionsByMacDeviceId.delete(macDeviceId);
-  }
-
-  const pairingCode = macRegistration?.pairingCode;
-  if (pairingCode) {
-    const existingPairingCode = liveSessionsByPairingCode.get(pairingCode);
-    if (existingPairingCode?.sessionId === sessionId) {
-      liveSessionsByPairingCode.delete(pairingCode);
-    }
-  }
-}
-
-function readMacRegistrationHeaders(headers, sessionId) {
-  return normalizeMacRegistration({
-    macDeviceId: readHeaderString(headers["x-mac-device-id"]),
-    macIdentityPublicKey: readHeaderString(headers["x-mac-identity-public-key"]),
-    displayName: readHeaderString(headers["x-machine-name"]),
-    trustedPhoneDeviceId: readHeaderString(headers["x-trusted-phone-device-id"]),
-    trustedPhonePublicKey: readHeaderString(headers["x-trusted-phone-public-key"]),
-    pairingCode: readHeaderString(headers["x-pairing-code"]),
-    pairingVersion: readHeaderString(headers["x-pairing-version"]),
-    pairingExpiresAt: readHeaderString(headers["x-pairing-expires-at"]),
-  }, sessionId);
-}
-
-function normalizeMacRegistration(registration, sessionId) {
-  return {
-    sessionId,
-    macDeviceId: normalizeNonEmptyString(registration?.macDeviceId),
-    macIdentityPublicKey: normalizeNonEmptyString(registration?.macIdentityPublicKey),
-    displayName: normalizeNonEmptyString(registration?.displayName),
-    trustedPhoneDeviceId: normalizeNonEmptyString(registration?.trustedPhoneDeviceId),
-    trustedPhonePublicKey: normalizeNonEmptyString(registration?.trustedPhonePublicKey),
-    pairingCode: normalizeShortPairingCode(registration?.pairingCode),
-    pairingVersion: normalizePositiveInteger(registration?.pairingVersion),
-    pairingExpiresAt: normalizePositiveInteger(registration?.pairingExpiresAt),
-  };
-}
-
-function buildTrustedSessionResolveBytes({
-  macDeviceId,
-  phoneDeviceId,
-  phoneIdentityPublicKey,
-  nonce,
-  timestamp,
-}) {
-  return Buffer.concat([
-    encodeLengthPrefixedUTF8(TRUSTED_SESSION_RESOLVE_TAG),
-    encodeLengthPrefixedUTF8(macDeviceId),
-    encodeLengthPrefixedUTF8(phoneDeviceId),
-    encodeLengthPrefixedData(Buffer.from(phoneIdentityPublicKey, "base64")),
-    encodeLengthPrefixedUTF8(nonce),
-    encodeLengthPrefixedUTF8(String(timestamp)),
-  ]);
-}
-
-function verifyTrustedSessionResolveSignature(publicKeyBase64, transcriptBytes, signatureBase64) {
-  try {
-    return verify(
-      null,
-      transcriptBytes,
-      createPublicKey({
-        key: {
-          crv: "Ed25519",
-          kty: "OKP",
-          x: base64ToBase64Url(publicKeyBase64),
-        },
-        format: "jwk",
-      }),
-      Buffer.from(signatureBase64, "base64")
-    );
-  } catch {
-    return false;
-  }
-}
-
-function pruneUsedResolveNonces(now) {
-  for (const [nonceKey, expiresAt] of usedResolveNonces.entries()) {
-    if (now >= expiresAt) {
-      usedResolveNonces.delete(nonceKey);
-    }
-  }
-}
-
-function encodeLengthPrefixedUTF8(value) {
-  return encodeLengthPrefixedData(Buffer.from(value, "utf8"));
-}
-
-function encodeLengthPrefixedData(value) {
-  const length = Buffer.allocUnsafe(4);
-  length.writeUInt32BE(value.length, 0);
-  return Buffer.concat([length, value]);
-}
-
-function base64ToBase64Url(value) {
-  return String(value || "")
-    .replaceAll("+", "-")
-    .replaceAll("/", "_")
-    .replace(/=+$/g, "");
-}
-
-function normalizeNonEmptyString(value) {
-  return typeof value === "string" && value.trim() ? value.trim() : "";
-}
-
-function normalizeShortPairingCode(value) {
-  if (typeof value !== "string") {
-    return "";
-  }
-
-  const normalized = value
-    .trim()
-    .toUpperCase()
-    .replace(/[\s-]+/g, "");
-  if (
-    normalized.length < SHORT_PAIRING_CODE_MIN_LENGTH
-    || normalized.length > SHORT_PAIRING_CODE_MAX_LENGTH
-    || !/^[ABCDEFGHJKLMNPQRSTUVWXYZ23456789]+$/.test(normalized)
-  ) {
-    return "";
-  }
-
-  return normalized;
-}
-
-function normalizePositiveInteger(value) {
-  const normalized = Number(value);
-  return Number.isFinite(normalized) && normalized > 0 ? normalized : 0;
-}
-
-function createRelayError(status, code, message) {
-  return Object.assign(new Error(message), {
-    status,
-    code,
-  });
-}
-
-function readHeaderString(value) {
-  const candidate = Array.isArray(value) ? value[0] : value;
-  return typeof candidate === "string" && candidate.trim() ? candidate.trim() : null;
-}
-
-function safeParseJSON(value) {
-  if (typeof value !== "string" || !value.trim()) {
     return null;
   }
 
-  try {
-    return JSON.parse(value);
-  } catch {
-    return null;
+  mobileSockets() {
+    return this.ctx.getWebSockets().filter((socket) => {
+      const attachment = socket.deserializeAttachment() || {};
+      return isRelayMobileRole(normalizeRelayRole(attachment.role)) && isOpenSocket(socket);
+    });
+  }
+
+  hasAnyOpenSocket() {
+    return this.ctx.getWebSockets().some(isOpenSocket);
+  }
+
+  async scheduleCleanup() {
+    const cleanupAfter = Date.now() + CLEANUP_DELAY_MS;
+    await this.ctx.storage.put("cleanupAfter", cleanupAfter);
+    await this.ctx.storage.setAlarm(cleanupAfter);
+  }
+
+  sessionStats() {
+    let totalClients = 0;
+    let sessionsWithOpenMac = 0;
+    for (const socket of this.ctx.getWebSockets()) {
+      const attachment = socket.deserializeAttachment() || {};
+      if (!isOpenSocket(socket)) {
+        continue;
+      }
+      if (attachment.role === "mac") {
+        sessionsWithOpenMac = 1;
+      } else if (isRelayMobileRole(attachment.role)) {
+        totalClients += 1;
+      }
+    }
+
+    return {
+      activeSessions: this.hasAnyOpenSocket() ? 1 : 0,
+      sessionsWithMac: sessionsWithOpenMac,
+      sessionsWithOpenMac,
+      sessionsWithStaleMac: 0,
+      sessionsWithClients: totalClients > 0 ? 1 : 0,
+      totalClients,
+      uptimeSeconds: Math.round((Date.now() - this.startedAt) / 1000),
+      acceptedConnections: this.metrics.acceptedConnections,
+      closedConnections: this.metrics.closedConnections,
+      heartbeatTerminations: 0,
+      macMessagesRelayed: this.metrics.macMessagesRelayed,
+      mobileMessagesRelayed: this.metrics.mobileMessagesRelayed,
+      mobileMessagesRejectedDuringMacAbsence: this.metrics.mobileMessagesRejectedDuringMacAbsence,
+    };
   }
 }
-
-module.exports = {
-  setupRelay,
-  getRelayStats,
-  hasActiveMacSession,
-  hasAuthenticatedMacSession,
-  resolvePairingCode,
-  resolveTrustedMacSession,
-};

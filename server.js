@@ -1,411 +1,392 @@
-// FILE: server.js
-// Purpose: Hosts the public Remodex relay plus optional push-notification HTTP endpoints.
-// Layer: Standalone server entrypoint
-// Exports: createRelayServer, createFixedWindowRateLimiter
-// Depends on: http, ws, ./relay, ./push-service
+import { DurableObject } from "cloudflare:workers";
+import { createAPNsClient, apnsConfigFromEnv } from "./apns-client.js";
+import { createDurableObjectPushStateStore, createPushSessionService } from "./push-service.js";
+import {
+  TRUSTED_SESSION_RESOLVE_SKEW_MS,
+  buildTrustedSessionResolveBytes,
+  clientAddressKey,
+  createFixedWindowRateLimiter,
+  createRelayError,
+  directoryStub,
+  drainRequestBody,
+  json,
+  normalizeMacRegistration,
+  normalizeNonEmptyString,
+  normalizeShortPairingCode,
+  readJSONBody,
+  readOptionalBooleanEnv,
+  readString,
+  relaySessionIdFromPath,
+  sessionStub,
+  verifyTrustedSessionResolveSignature,
+} from "./shared.js";
 
-const http = require("http");
-const { monitorEventLoopDelay } = require("perf_hooks");
-const { WebSocketServer } = require("ws");
-const {
-  setupRelay,
-  getRelayStats,
-  hasAuthenticatedMacSession,
-  resolvePairingCode,
-  resolveTrustedMacSession,
-} = require("./relay");
-const { createPushSessionService } = require("./push-service");
+export default {
+  async fetch(request, env, ctx) {
+    const url = new URL(request.url);
 
-function createRelayServer({
-  enablePushService = false,
-  exposeDetailedHealth = false,
-  httpRateLimiter = createFixedWindowRateLimiter({ windowMs: 60_000, maxRequests: 120 }),
-  pushRateLimiter = createFixedWindowRateLimiter({ windowMs: 60_000, maxRequests: 30 }),
-  upgradeRateLimiter = createFixedWindowRateLimiter({ windowMs: 60_000, maxRequests: 60 }),
-  pushSessionService,
-  relayOptions = {},
-  trustProxy = false,
-} = {}) {
-  const runtimeMetrics = createRuntimeMetrics();
-  const pushEnabled = Boolean(enablePushService || pushSessionService);
-  const resolvedPushSessionService = pushEnabled
-    ? (pushSessionService || createPushSessionService({
-      // The first registration must match the live bridge's secret, not just the session id.
-      canRegisterSession({ sessionId, notificationSecret }) {
-        return hasAuthenticatedMacSession(sessionId, notificationSecret);
-      },
-      // Completion pushes are only valid while the Mac side of that relay session is still live.
-      canNotifyCompletion({ sessionId, notificationSecret }) {
-        return hasAuthenticatedMacSession(sessionId, notificationSecret);
-      },
-    }))
-    : createDisabledPushSessionService();
-
-  const server = http.createServer((req, res) => {
-    void handleHTTPRequest(req, res, {
-      exposeDetailedHealth,
-      httpRateLimiter,
-      pushEnabled,
-      pushRateLimiter,
-      pushSessionService: resolvedPushSessionService,
-      runtimeMetrics,
-      trustProxy,
-    });
-  });
-  const wss = new WebSocketServer({ noServer: true });
-  setupRelay(wss, relayOptions);
-
-  server.on("upgrade", (req, socket, head) => {
-    const pathname = safePathname(req.url);
-    const loggedPathname = redactRelayPathname(pathname);
-    console.log(
-      `[relay] upgrade request path=${loggedPathname} remote=${clientAddressKey(req, { trustProxy })} `
-      + `role=${readHeaderString(req.headers["x-role"]) || "missing"}`
-    );
-    if (!pathname.startsWith("/relay/")) {
-      console.log(`[relay] rejecting upgrade for non-relay path: ${loggedPathname}`);
-      socket.destroy();
-      return;
+    if (url.pathname.startsWith("/internal/")) {
+      return json({ ok: false, error: "Not found" }, 404);
     }
 
-    if (!upgradeRateLimiter.allow(clientAddressKey(req, { trustProxy }))) {
-      console.log(`[relay] rejecting upgrade due to rate limit: ${loggedPathname}`);
-      socket.write(
-        "HTTP/1.1 429 Too Many Requests\r\n" +
-        "Connection: close\r\n" +
-        "Retry-After: 60\r\n\r\n"
+    if (url.pathname.startsWith("/relay/")) {
+      const sessionId = relaySessionIdFromPath(url.pathname);
+      if (!sessionId) {
+        return json({ ok: false, error: "Missing sessionId" }, 400);
+      }
+      return sessionStub(env, sessionId).fetch(request);
+    }
+
+    if (request.method === "GET" && url.pathname === "/health") {
+      const exposeDetailedHealth = readOptionalBooleanEnv(
+        ["REMODEX_EXPOSE_DETAILED_HEALTH", "PHODEX_EXPOSE_DETAILED_HEALTH"],
+        env
+      ) ?? false;
+      if (!exposeDetailedHealth) {
+        return json({ ok: true });
+      }
+      return directoryStub(env).fetch(
+        new Request("https://remodex.internal/internal/directory/stats")
       );
-      socket.destroy();
-      return;
     }
 
-    wss.handleUpgrade(req, socket, head, (ws) => {
-      wss.emit("connection", ws, req);
+    return directoryStub(env).fetch(request);
+  },
+};
+
+export class RelayDirectory extends DurableObject {
+  constructor(ctx, env) {
+    super(ctx, env);
+    this.startedAt = Date.now();
+    this.httpRateLimiter = createFixedWindowRateLimiter({
+      windowMs: 60_000,
+      maxRequests: 120,
     });
-  });
-
-  return {
-    server,
-    wss,
-    pushSessionService: resolvedPushSessionService,
-  };
-}
-
-async function handleHTTPRequest(req, res, {
-  exposeDetailedHealth,
-  httpRateLimiter,
-  pushEnabled,
-  pushRateLimiter,
-  pushSessionService,
-  runtimeMetrics,
-  trustProxy,
-}) {
-  const pathname = safePathname(req.url);
-  if (req.method === "GET" && pathname === "/health") {
-    return writeJSON(
-      res,
-      200,
-      exposeDetailedHealth
-        ? {
-            ok: true,
-            relay: getRelayStats(),
-            push: pushSessionService.getStats(),
-            runtime: runtimeMetrics.snapshot(),
-          }
-        : { ok: true }
-    );
   }
 
-  const requestKey = clientAddressKey(req, { trustProxy });
-  if (!httpRateLimiter.allow(requestKey)) {
-    return writeRateLimitResponse(res);
-  }
+  async fetch(request) {
+    const url = new URL(request.url);
 
-  if (req.method === "POST" && pathname === "/v1/push/session/register-device") {
-    if (!pushEnabled) {
-      return writeJSON(res, 404, {
-        ok: false,
-        error: "Not found",
+    if (request.method === "GET" && url.pathname === "/internal/directory/stats") {
+      return json({
+        ok: true,
+        relay: await this.stats(),
+        push: await this.pushStats(),
+        runtime: {
+          uptimeSeconds: Math.round((Date.now() - this.startedAt) / 1000),
+        },
       });
     }
-    if (!pushRateLimiter.allow(`${requestKey}:register-device`)) {
-      return writeRateLimitResponse(res);
-    }
-    return handleJSONRoute(req, res, async (body) => pushSessionService.registerDevice(body));
-  }
 
-  if (req.method === "POST" && pathname === "/v1/push/session/notify-completion") {
-    if (!pushEnabled) {
-      return writeJSON(res, 404, {
-        ok: false,
-        error: "Not found",
+    if (request.method === "POST" && url.pathname === "/internal/directory/register") {
+      const registration = normalizeMacRegistration(await readJSONBody(request), "");
+      if (!registration.macDeviceId || !registration.sessionId) {
+        return json({ ok: false, error: "Invalid registration" }, 400);
+      }
+      await this.registerMacSession(registration);
+      return json({ ok: true });
+    }
+
+    if (request.method === "POST" && url.pathname === "/internal/directory/unregister") {
+      const body = await readJSONBody(request);
+      await this.unregisterMacSession({
+        macDeviceId: readString(body.macDeviceId),
+        pairingCode: normalizeShortPairingCode(body.pairingCode),
+        sessionId: readString(body.sessionId),
+      });
+      return json({ ok: true });
+    }
+
+    if (!this.httpRateLimiter.allow(clientAddressKey(request))) {
+      return json({ ok: false, error: "Too many requests", code: "rate_limited" }, 429, {
+        "retry-after": "60",
       });
     }
-    if (!pushRateLimiter.allow(`${requestKey}:notify-completion`)) {
-      return writeRateLimitResponse(res);
+
+    if (request.method === "POST" && url.pathname === "/v1/trusted/session/resolve") {
+      return this.handleJSONRoute(request, (body) => this.resolveTrustedMacSession(body));
     }
-    return handleJSONRoute(req, res, async (body) => pushSessionService.notifyCompletion(body));
+
+    if (request.method === "POST" && url.pathname === "/v1/pairing/code/resolve") {
+      return this.handleJSONRoute(request, (body) => this.resolvePairingCode(body));
+    }
+
+    if (request.method === "POST" && url.pathname === "/v1/push/session/register-device") {
+      if (!this.pushEnabled()) {
+        await drainRequestBody(request);
+        return json({ ok: false, error: "Not found" }, 404);
+      }
+      return this.handleJSONRoute(request, (body) => this.pushService().registerDevice(body));
+    }
+
+    if (request.method === "POST" && url.pathname === "/v1/push/session/notify-completion") {
+      if (!this.pushEnabled()) {
+        await drainRequestBody(request);
+        return json({ ok: false, error: "Not found" }, 404);
+      }
+      return this.handleJSONRoute(request, (body) => this.pushService().notifyCompletion(body));
+    }
+
+    return json({ ok: false, error: "Not found" }, 404);
   }
 
-  if (req.method === "POST" && pathname === "/v1/trusted/session/resolve") {
-    return handleJSONRoute(req, res, async (body) => resolveTrustedMacSession(body));
+  async handleJSONRoute(request, handler) {
+    try {
+      const body = await readJSONBody(request);
+      const result = await handler(body);
+      return json(result);
+    } catch (error) {
+      return json({
+        ok: false,
+        error: error.message || "Internal server error",
+        code: error.code || "internal_error",
+      }, error.status || 500);
+    }
   }
 
-  if (req.method === "POST" && pathname === "/v1/pairing/code/resolve") {
-    return handleJSONRoute(req, res, async (body) => resolvePairingCode(body));
+  pushEnabled() {
+    return readOptionalBooleanEnv(
+      ["REMODEX_ENABLE_PUSH_SERVICE", "PHODEX_ENABLE_PUSH_SERVICE"],
+      this.env
+    ) ?? false;
   }
 
-  return writeJSON(res, 404, {
-    ok: false,
-    error: "Not found",
-  });
-}
-
-async function handleJSONRoute(req, res, handler) {
-  try {
-    const body = await readJSONBody(req);
-    const result = await handler(body);
-    return writeJSON(res, 200, result);
-  } catch (error) {
-    return writeJSON(res, error.status || 500, {
-      ok: false,
-      error: error.message || "Internal server error",
-      code: error.code || "internal_error",
+  pushService() {
+    return createPushSessionService({
+      apnsClient: createAPNsClient(apnsConfigFromEnv(this.env)),
+      canRegisterSession: ({ sessionId, notificationSecret }) => (
+        this.hasAuthenticatedMacSession(sessionId, notificationSecret)
+      ),
+      canNotifyCompletion: ({ sessionId, notificationSecret }) => (
+        this.hasAuthenticatedMacSession(sessionId, notificationSecret)
+      ),
+      stateStore: createDurableObjectPushStateStore(this.ctx.storage),
     });
   }
-}
 
-function readJSONBody(req) {
-  return new Promise((resolve, reject) => {
-    const chunks = [];
-    let totalSize = 0;
-
-    req.on("data", (chunk) => {
-      totalSize += chunk.length;
-      if (totalSize > 64 * 1024) {
-        reject(Object.assign(new Error("Request body too large"), {
-          status: 413,
-          code: "body_too_large",
-        }));
-        req.destroy();
-        return;
-      }
-      chunks.push(chunk);
-    });
-
-    req.on("end", () => {
-      const rawBody = Buffer.concat(chunks).toString("utf8");
-      if (!rawBody.trim()) {
-        resolve({});
-        return;
-      }
-
-      try {
-        resolve(JSON.parse(rawBody));
-      } catch {
-        reject(Object.assign(new Error("Invalid JSON body"), {
-          status: 400,
-          code: "invalid_json",
-        }));
-      }
-    });
-
-    req.on("error", reject);
-  });
-}
-
-function writeJSON(res, status, body) {
-  res.statusCode = status;
-  res.setHeader("content-type", "application/json");
-  res.end(JSON.stringify(body));
-}
-
-function writeRateLimitResponse(res) {
-  res.setHeader("retry-after", "60");
-  return writeJSON(res, 429, {
-    ok: false,
-    error: "Too many requests",
-    code: "rate_limited",
-  });
-}
-
-function createDisabledPushSessionService() {
-  return {
-    getStats() {
+  async pushStats() {
+    if (!this.pushEnabled()) {
       return {
         enabled: false,
         registeredSessions: 0,
         deliveredDedupeKeys: 0,
         apnsConfigured: false,
       };
-    },
-  };
-}
+    }
 
-// Captures process-level pressure that can make WebSocket heartbeats miss deadlines.
-function createRuntimeMetrics() {
-  const eventLoopDelay = monitorEventLoopDelay({ resolution: 20 });
-  eventLoopDelay.enable();
-  const startedAt = Date.now();
-
-  return {
-    snapshot() {
-      const memory = process.memoryUsage();
-      return {
-        uptimeSeconds: Math.round((Date.now() - startedAt) / 1000),
-        eventLoopDelayMs: {
-          mean: nanosecondsToMilliseconds(eventLoopDelay.mean),
-          max: nanosecondsToMilliseconds(eventLoopDelay.max),
-          p99: nanosecondsToMilliseconds(eventLoopDelay.percentile(99)),
-        },
-        memory: {
-          rss: memory.rss,
-          heapUsed: memory.heapUsed,
-          heapTotal: memory.heapTotal,
-          external: memory.external,
-        },
-      };
-    },
-  };
-}
-
-function nanosecondsToMilliseconds(value) {
-  return Number.isFinite(value) ? Math.round(value / 1_000_000) : 0;
-}
-
-function safePathname(rawUrl) {
-  try {
-    return new URL(rawUrl || "/", "http://localhost").pathname;
-  } catch {
-    return "/";
-  }
-}
-
-// Hides bearer-like relay session ids from operational logs while preserving route shape.
-function redactRelayPathname(pathname) {
-  if (typeof pathname !== "string" || !pathname.startsWith("/relay/")) {
-    return pathname || "/";
+    return {
+      enabled: true,
+      ...await this.pushService().getStats(),
+    };
   }
 
-  const [, relayPrefix, ...rest] = pathname.split("/");
-  const suffix = rest.length > 1 ? `/${rest.slice(1).join("/")}` : "";
-  return `/${relayPrefix}/[session]${suffix}`;
-}
+  async registerMacSession(registration) {
+    const existing = await this.ctx.storage.get(`mac:${registration.macDeviceId}`);
+    if (
+      existing?.pairingCode
+      && existing.pairingCode !== registration.pairingCode
+    ) {
+      await this.ctx.storage.delete(`pair:${existing.pairingCode}`);
+    }
 
-// Trust forwarded client IPs only when a known reverse proxy sits in front of the relay.
-function clientAddressKey(req, { trustProxy = false } = {}) {
-  if (trustProxy) {
-    return forwardedClientAddress(req) || req?.socket?.remoteAddress || "unknown";
-  }
-  return req?.socket?.remoteAddress || "unknown";
-}
-
-function forwardedClientAddress(req) {
-  const xRealIP = readHeaderString(req?.headers?.["x-real-ip"]);
-  if (xRealIP) {
-    return xRealIP;
-  }
-
-  const xForwardedFor = readHeaderString(req?.headers?.["x-forwarded-for"]);
-  if (xForwardedFor) {
-    const forwardedHops = xForwardedFor
-      .split(",")
-      .map((value) => value.trim())
-      .filter(Boolean);
-    const clientHop = forwardedHops[0];
-    if (clientHop) {
-      return clientHop;
+    await this.ctx.storage.put(`mac:${registration.macDeviceId}`, registration);
+    if (registration.pairingCode && Number.isFinite(registration.pairingExpiresAt)) {
+      await this.ctx.storage.put(`pair:${registration.pairingCode}`, registration);
     }
   }
 
-  return "";
-}
-
-function readHeaderString(value) {
-  const candidate = Array.isArray(value) ? value[0] : value;
-  return typeof candidate === "string" && candidate.trim() ? candidate.trim() : "";
-}
-
-// Reads an opt-in boolean flag for hosted deployments without changing local/self-host defaults.
-function readOptionalBooleanEnv(keys, env = process.env) {
-  const truthy = new Set(["1", "true", "yes", "on"]);
-  const falsy = new Set(["0", "false", "no", "off"]);
-
-  for (const key of keys) {
-    const rawValue = env?.[key];
-    if (typeof rawValue !== "string" || !rawValue.trim()) {
-      continue;
+  async unregisterMacSession({ macDeviceId, pairingCode, sessionId }) {
+    if (macDeviceId) {
+      const existing = await this.ctx.storage.get(`mac:${macDeviceId}`);
+      if (existing?.sessionId === sessionId) {
+        await this.ctx.storage.delete(`mac:${macDeviceId}`);
+      }
     }
-    const normalizedValue = rawValue.trim().toLowerCase();
-    if (truthy.has(normalizedValue)) {
-      return true;
+
+    if (pairingCode) {
+      const existingPairingCode = await this.ctx.storage.get(`pair:${pairingCode}`);
+      if (existingPairingCode?.sessionId === sessionId) {
+        await this.ctx.storage.delete(`pair:${pairingCode}`);
+      }
     }
-    if (falsy.has(normalizedValue)) {
+  }
+
+  async resolveTrustedMacSession({
+    macDeviceId,
+    phoneDeviceId,
+    phoneIdentityPublicKey,
+    timestamp,
+    nonce,
+    signature,
+  } = {}) {
+    const normalizedMacDeviceId = normalizeNonEmptyString(macDeviceId);
+    const normalizedPhoneDeviceId = normalizeNonEmptyString(phoneDeviceId);
+    const normalizedPhoneIdentityPublicKey = normalizeNonEmptyString(phoneIdentityPublicKey);
+    const normalizedNonce = normalizeNonEmptyString(nonce);
+    const normalizedSignature = normalizeNonEmptyString(signature);
+    const normalizedTimestamp = Number(timestamp);
+    const now = Date.now();
+
+    if (
+      !normalizedMacDeviceId
+      || !normalizedPhoneDeviceId
+      || !normalizedPhoneIdentityPublicKey
+      || !normalizedNonce
+      || !normalizedSignature
+      || !Number.isFinite(normalizedTimestamp)
+    ) {
+      throw createRelayError(400, "invalid_request", "The trusted-session resolve request is missing required fields.");
+    }
+
+    if (Math.abs(now - normalizedTimestamp) > TRUSTED_SESSION_RESOLVE_SKEW_MS) {
+      throw createRelayError(401, "resolve_request_expired", "This trusted-session resolve request has expired.");
+    }
+
+    await this.pruneUsedResolveNonces(now);
+    const nonceKey = `nonce:${normalizedMacDeviceId}|${normalizedPhoneDeviceId}|${normalizedNonce}`;
+    if (await this.ctx.storage.get(nonceKey)) {
+      throw createRelayError(409, "resolve_request_replayed", "This trusted-session resolve request was already used.");
+    }
+
+    const liveSession = await this.ctx.storage.get(`mac:${normalizedMacDeviceId}`);
+    if (!liveSession || !(await this.hasActiveMacSession(liveSession.sessionId))) {
+      throw createRelayError(404, "session_unavailable", "The trusted Mac is offline right now.");
+    }
+
+    if (
+      liveSession.trustedPhoneDeviceId !== normalizedPhoneDeviceId
+      || liveSession.trustedPhonePublicKey !== normalizedPhoneIdentityPublicKey
+    ) {
+      throw createRelayError(403, "phone_not_trusted", "This iPhone is not trusted for the requested Mac.");
+    }
+
+    const transcriptBytes = buildTrustedSessionResolveBytes({
+      macDeviceId: normalizedMacDeviceId,
+      phoneDeviceId: normalizedPhoneDeviceId,
+      phoneIdentityPublicKey: normalizedPhoneIdentityPublicKey,
+      nonce: normalizedNonce,
+      timestamp: normalizedTimestamp,
+    });
+    if (!await verifyTrustedSessionResolveSignature(
+      normalizedPhoneIdentityPublicKey,
+      transcriptBytes,
+      normalizedSignature
+    )) {
+      throw createRelayError(403, "invalid_signature", "The trusted-session resolve signature is invalid.");
+    }
+
+    await this.ctx.storage.put(nonceKey, now + TRUSTED_SESSION_RESOLVE_SKEW_MS);
+    return {
+      ok: true,
+      macDeviceId: normalizedMacDeviceId,
+      macIdentityPublicKey: liveSession.macIdentityPublicKey,
+      displayName: liveSession.displayName || null,
+      sessionId: liveSession.sessionId,
+    };
+  }
+
+  async resolvePairingCode({ code } = {}) {
+    const normalizedCode = normalizeShortPairingCode(code);
+    if (!normalizedCode) {
+      throw createRelayError(400, "invalid_request", "The pairing code is missing or malformed.");
+    }
+
+    const registration = await this.ctx.storage.get(`pair:${normalizedCode}`);
+    if (!registration || !(await this.hasActiveMacSession(registration.sessionId))) {
+      throw createRelayError(404, "pairing_code_unavailable", "This pairing code is unavailable.");
+    }
+
+    if (
+      !Number.isFinite(registration.pairingExpiresAt)
+      || Date.now() > registration.pairingExpiresAt
+    ) {
+      await this.ctx.storage.delete(`pair:${normalizedCode}`);
+      throw createRelayError(410, "pairing_code_expired", "This pairing code has expired.");
+    }
+
+    if (
+      !registration.macDeviceId
+      || !registration.macIdentityPublicKey
+      || !Number.isFinite(registration.pairingVersion)
+    ) {
+      throw createRelayError(409, "pairing_code_incomplete", "The bridge pairing metadata is incomplete.");
+    }
+
+    return {
+      ok: true,
+      v: registration.pairingVersion,
+      sessionId: registration.sessionId,
+      macDeviceId: registration.macDeviceId,
+      macIdentityPublicKey: registration.macIdentityPublicKey,
+      expiresAt: registration.pairingExpiresAt,
+    };
+  }
+
+  async hasActiveMacSession(sessionId) {
+    if (!sessionId) {
       return false;
     }
+    const response = await sessionStub(this.env, sessionId)
+      .fetch("https://remodex.internal/internal/session/active");
+    if (!response.ok) {
+      return false;
+    }
+    const body = await response.json();
+    return body.active === true;
   }
 
-  return undefined;
-}
+  async hasAuthenticatedMacSession(sessionId, notificationSecret) {
+    if (!sessionId || !notificationSecret) {
+      return false;
+    }
+    const response = await sessionStub(this.env, sessionId)
+      .fetch(new Request("https://remodex.internal/internal/session/authenticated", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ notificationSecret }),
+      }));
+    if (!response.ok) {
+      return false;
+    }
+    const body = await response.json();
+    return body.authenticated === true;
+  }
 
-function createFixedWindowRateLimiter({ windowMs, maxRequests, now = () => Date.now() } = {}) {
-  const buckets = new Map();
-  const resolvedWindowMs = Number.isFinite(windowMs) && windowMs > 0 ? windowMs : 60_000;
-  const resolvedMaxRequests = Number.isFinite(maxRequests) && maxRequests > 0 ? maxRequests : 60;
-  let nextPruneAt = 0;
-
-  return {
-    allow(key) {
-      const normalizedKey = typeof key === "string" && key.trim() ? key.trim() : "unknown";
-      const timestamp = now();
-      if (timestamp >= nextPruneAt) {
-        nextPruneAt = timestamp + resolvedWindowMs;
-        for (const [bucketKey, bucketValue] of buckets.entries()) {
-          if (timestamp >= bucketValue.expiresAt) {
-            buckets.delete(bucketKey);
-          }
-        }
+  async pruneUsedResolveNonces(now) {
+    const entries = await this.ctx.storage.list({ prefix: "nonce:" });
+    const deletes = [];
+    for (const [key, expiresAt] of entries) {
+      if (now >= Number(expiresAt || 0)) {
+        deletes.push(key);
       }
-      const bucket = buckets.get(normalizedKey);
+    }
+    if (deletes.length > 0) {
+      await this.ctx.storage.delete(deletes);
+    }
+  }
 
-      if (!bucket || timestamp >= bucket.expiresAt) {
-        buckets.set(normalizedKey, {
-          count: 1,
-          expiresAt: timestamp + resolvedWindowMs,
-        });
-        return true;
-      }
-
-      if (bucket.count >= resolvedMaxRequests) {
-        return false;
-      }
-
-      bucket.count += 1;
-      return true;
-    },
-    bucketCount() {
-      return buckets.size;
-    },
-  };
+  async stats() {
+    const macEntries = await this.ctx.storage.list({ prefix: "mac:" });
+    const pairEntries = await this.ctx.storage.list({ prefix: "pair:" });
+    const nonceEntries = await this.ctx.storage.list({ prefix: "nonce:" });
+    return {
+      activeSessions: macEntries.size,
+      sessionsWithMac: macEntries.size,
+      sessionsWithOpenMac: macEntries.size,
+      sessionsWithStaleMac: 0,
+      sessionsWithClients: 0,
+      totalClients: 0,
+      pairingCodes: pairEntries.size,
+      cleanupPending: 0,
+      macAbsencePending: 0,
+      uptimeSeconds: Math.round((Date.now() - this.startedAt) / 1000),
+      acceptedConnections: 0,
+      closedConnections: 0,
+      heartbeatTerminations: 0,
+      macMessagesRelayed: 0,
+      mobileMessagesRelayed: 0,
+      mobileMessagesRejectedDuringMacAbsence: 0,
+      usedResolveNonces: nonceEntries.size,
+    };
+  }
 }
-
-if (require.main === module) {
-  const port = Number(process.env.PORT || 9000);
-  const trustProxy = readOptionalBooleanEnv(["REMODEX_TRUST_PROXY", "PHODEX_TRUST_PROXY"]) ?? false;
-  const enablePushService = readOptionalBooleanEnv(
-    ["REMODEX_ENABLE_PUSH_SERVICE", "PHODEX_ENABLE_PUSH_SERVICE"]
-  ) ?? false;
-  const bindHost = process.env.RELAY_BIND_HOST || "0.0.0.0";
-  const { server } = createRelayServer({ enablePushService, trustProxy });
-  server.listen(port, bindHost, () => {
-    console.log(`[relay] listening on ${bindHost}:${port}`);
-  });
-}
-
-module.exports = {
-  createRelayServer,
-  createFixedWindowRateLimiter,
-  clientAddressKey,
-  readOptionalBooleanEnv,
-  redactRelayPathname,
-};

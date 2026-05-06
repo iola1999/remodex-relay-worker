@@ -1,23 +1,17 @@
-// FILE: apns-client.js
-// Purpose: Sends APNs alert pushes for relay-hosted Remodex notifications using token-based auth.
-// Layer: Hosted service helper
-// Exports: createAPNsClient
-// Depends on: crypto, http2
-
-const crypto = require("crypto");
-const http2 = require("http2");
+import { bytesToBase64Url, readString, textEncoder } from "./shared.js";
 
 const APNS_TOKEN_TTL_SECONDS = 50 * 60;
 
-function createAPNsClient({
+export function createAPNsClient({
   teamId = "",
   keyId = "",
   bundleId = "",
   privateKey = "",
   now = () => Date.now(),
-  http2Connect = http2.connect,
+  fetchFn = fetch,
 } = {}) {
   let cachedToken = null;
+  let cachedKey = null;
 
   function isConfigured() {
     return Boolean(teamId && keyId && bundleId && privateKey);
@@ -42,43 +36,40 @@ function createAPNsClient({
     const authority = apnsEnvironment === "development"
       ? "https://api.sandbox.push.apple.com"
       : "https://api.push.apple.com";
-    const client = http2Connect(authority);
-
-    try {
-      const response = await sendRequest(client, {
-        ":method": "POST",
-        ":path": `/3/device/${normalizedDeviceToken}`,
-        authorization: `bearer ${authorizationToken()}`,
+    const response = await fetchFn(`${authority}/3/device/${normalizedDeviceToken}`, {
+      method: "POST",
+      headers: {
+        authorization: `bearer ${await authorizationToken()}`,
         "apns-topic": bundleId,
         "apns-push-type": "alert",
         "apns-priority": "10",
         "content-type": "application/json",
-      }, JSON.stringify({
+      },
+      body: JSON.stringify({
         aps: {
           alert: {
-            title: normalizeString(title) || "Remodex",
-            body: normalizeString(body) || "Response ready",
+            title: readString(title) || "Remodex",
+            body: readString(body) || "Response ready",
           },
           sound: "default",
         },
         ...payload,
-      }));
+      }),
+    });
 
-      if (response.status >= 400) {
-        throw apnsError(
-          "apns_request_failed",
-          response.body?.reason || `APNs request failed with HTTP ${response.status}.`,
-          response.status
-        );
-      }
-
-      return { ok: true };
-    } finally {
-      client.close();
+    if (response.status >= 400) {
+      const responseBody = await safeResponseJSON(response);
+      throw apnsError(
+        "apns_request_failed",
+        responseBody?.reason || `APNs request failed with HTTP ${response.status}.`,
+        response.status
+      );
     }
+
+    return { ok: true };
   }
 
-  function authorizationToken() {
+  async function authorizationToken() {
     const issuedAt = Math.floor(now() / 1000);
     if (cachedToken && cachedToken.expiresAt > issuedAt + 30) {
       return cachedToken.value;
@@ -87,11 +78,12 @@ function createAPNsClient({
     const header = base64UrlJSON({ alg: "ES256", kid: keyId });
     const claims = base64UrlJSON({ iss: teamId, iat: issuedAt });
     const signingInput = `${header}.${claims}`;
-    const signature = crypto.sign("sha256", Buffer.from(signingInput), {
-      key: privateKey,
-      dsaEncoding: "ieee-p1363",
-    });
-    const token = `${signingInput}.${base64Url(signature)}`;
+    const signature = await crypto.subtle.sign(
+      { name: "ECDSA", hash: "SHA-256" },
+      await signingKey(),
+      textEncoder.encode(signingInput)
+    );
+    const token = `${signingInput}.${bytesToBase64Url(new Uint8Array(signature))}`;
 
     cachedToken = {
       value: token,
@@ -100,62 +92,54 @@ function createAPNsClient({
     return token;
   }
 
+  async function signingKey() {
+    if (cachedKey) {
+      return cachedKey;
+    }
+    cachedKey = await crypto.subtle.importKey(
+      "pkcs8",
+      pemToDer(privateKey),
+      { name: "ECDSA", namedCurve: "P-256" },
+      false,
+      ["sign"]
+    );
+    return cachedKey;
+  }
+
   return {
     isConfigured,
     sendNotification,
   };
 }
 
-function sendRequest(client, headers, body) {
-  return new Promise((resolve, reject) => {
-    const request = client.request(headers);
-    const chunks = [];
-    let responseHeaders = null;
-
-    request.setEncoding("utf8");
-    request.on("response", (headers) => {
-      responseHeaders = headers;
-    });
-    request.on("data", (chunk) => {
-      chunks.push(chunk);
-    });
-    request.on("end", () => {
-      resolve({
-        status: Number(responseHeaders?.[":status"] || 0),
-        body: safeParseJSON(chunks.join("")),
-      });
-    });
-    request.on("error", reject);
-    request.end(body);
-  });
-}
-
-function safeParseJSON(value) {
-  if (!value) {
-    return null;
-  }
-
-  try {
-    return JSON.parse(value);
-  } catch {
-    return null;
-  }
+export function apnsConfigFromEnv(env = {}) {
+  return {
+    teamId: readFirstDefinedEnv(["REMODEX_APNS_TEAM_ID", "PHODEX_APNS_TEAM_ID"], env),
+    keyId: readFirstDefinedEnv(["REMODEX_APNS_KEY_ID", "PHODEX_APNS_KEY_ID"], env),
+    bundleId: readFirstDefinedEnv(["REMODEX_APNS_BUNDLE_ID", "PHODEX_APNS_BUNDLE_ID"], env),
+    privateKey: readFirstDefinedEnv(["REMODEX_APNS_PRIVATE_KEY", "PHODEX_APNS_PRIVATE_KEY"], env),
+  };
 }
 
 function base64UrlJSON(value) {
-  return base64Url(Buffer.from(JSON.stringify(value)));
+  return bytesToBase64Url(textEncoder.encode(JSON.stringify(value)));
 }
 
-function base64Url(value) {
-  return Buffer.from(value)
-    .toString("base64")
-    .replace(/\+/g, "-")
-    .replace(/\//g, "_")
-    .replace(/=+$/g, "");
+function pemToDer(pem) {
+  const base64 = String(pem || "")
+    .replace(/-----BEGIN PRIVATE KEY-----/g, "")
+    .replace(/-----END PRIVATE KEY-----/g, "")
+    .replace(/\s+/g, "");
+  const binary = atob(base64);
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index += 1) {
+    bytes[index] = binary.charCodeAt(index);
+  }
+  return bytes;
 }
 
 function normalizeDeviceToken(value) {
-  const normalized = normalizeString(value);
+  const normalized = readString(value);
   if (!normalized) {
     return "";
   }
@@ -163,8 +147,22 @@ function normalizeDeviceToken(value) {
   return normalized.replace(/[^a-fA-F0-9]/g, "").toLowerCase();
 }
 
-function normalizeString(value) {
-  return typeof value === "string" && value.trim() ? value.trim() : "";
+function readFirstDefinedEnv(keys, env) {
+  for (const key of keys) {
+    const value = readString(env?.[key]);
+    if (value) {
+      return value;
+    }
+  }
+  return "";
+}
+
+async function safeResponseJSON(response) {
+  try {
+    return await response.json();
+  } catch {
+    return null;
+  }
 }
 
 function apnsError(code, message, status) {
@@ -173,7 +171,3 @@ function apnsError(code, message, status) {
   error.status = status;
   return error;
 }
-
-module.exports = {
-  createAPNsClient,
-};

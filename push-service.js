@@ -1,36 +1,19 @@
-// FILE: push-service.js
-// Purpose: Stores session-scoped APNs registration state and sends completion pushes for relay-hosted Remodex sessions.
-// Layer: Hosted service helper
-// Exports: createPushSessionService, createFileBackedPushStateStore, resolvePushStateFilePath
-// Depends on: crypto, fs, os, path, ./apns-client
-
-const crypto = require("crypto");
-const fs = require("fs");
-const os = require("os");
-const path = require("path");
-const { createAPNsClient } = require("./apns-client");
+import { readString, secretsEqual } from "./shared.js";
 
 const PUSH_DEDUPE_TTL_MS = 24 * 60 * 60 * 1000;
 const PUSH_SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const PUSH_PREVIEW_MAX_CHARS = 160;
 
-function createPushSessionService({
-  apnsClient = createAPNsClient(apnsConfigFromEnv(process.env)),
+export function createPushSessionService({
+  apnsClient,
   canRegisterSession = () => true,
   canNotifyCompletion = null,
   now = () => Date.now(),
-  logPrefix = "[relay]",
-  stateStore = createFileBackedPushStateStore({
-    stateFilePath: resolvePushStateFilePath(process.env),
-  }),
+  stateStore,
 } = {}) {
   const resolvedCanNotifyCompletion = typeof canNotifyCompletion === "function"
     ? canNotifyCompletion
     : canRegisterSession;
-  const persistedState = stateStore.read();
-  const sessions = new Map(persistedState.sessions || []);
-  const deliveredDedupeKeys = new Map(persistedState.deliveredDedupeKeys || []);
-  pruneStaleState();
 
   async function registerDevice({
     sessionId,
@@ -62,19 +45,19 @@ function createPushSessionService({
       );
     }
 
-    const existing = sessions.get(normalizedSessionId);
-    if (existing && !secretsEqual(existing.notificationSecret, normalizedSecret)) {
+    const existing = await stateStore.getSession(normalizedSessionId);
+    if (existing && !await secretsEqual(existing.notificationSecret, normalizedSecret)) {
       throw pushServiceError("unauthorized", "Invalid notification secret for this session.", 403);
     }
 
-    sessions.set(normalizedSessionId, {
+    await stateStore.setSession(normalizedSessionId, {
       notificationSecret: normalizedSecret,
       deviceToken: normalizedDeviceToken,
       alertsEnabled: Boolean(alertsEnabled),
       apnsEnvironment: apnsEnvironment === "development" ? "development" : "production",
       updatedAt: now(),
     });
-    persistState("registerDevice");
+    await pruneStaleState();
     return { ok: true };
   }
 
@@ -113,13 +96,13 @@ function createPushSessionService({
       );
     }
 
-    pruneDeliveredDedupeKeys();
-    if (deliveredDedupeKeys.has(normalizedDedupeKey)) {
+    await pruneDeliveredDedupeKeys();
+    if (await stateStore.getDedupeKey(normalizedDedupeKey)) {
       return { ok: true, deduped: true };
     }
 
-    const session = sessions.get(normalizedSessionId);
-    if (!session || !secretsEqual(session.notificationSecret, normalizedSecret)) {
+    const session = await stateStore.getSession(normalizedSessionId);
+    if (!session || !await secretsEqual(session.notificationSecret, normalizedSecret)) {
       throw pushServiceError("unauthorized", "Invalid notification secret for this session.", 403);
     }
 
@@ -140,62 +123,32 @@ function createPushSessionService({
       },
     });
 
-    deliveredDedupeKeys.set(normalizedDedupeKey, now());
-    persistState("notifyCompletion");
+    await stateStore.setDedupeKey(normalizedDedupeKey, now());
     return { ok: true };
   }
 
-  function getStats() {
-    pruneDeliveredDedupeKeys();
+  async function getStats() {
+    await pruneStaleState();
     return {
-      registeredSessions: sessions.size,
-      deliveredDedupeKeys: deliveredDedupeKeys.size,
+      registeredSessions: await stateStore.sessionCount(),
+      deliveredDedupeKeys: await stateStore.dedupeKeyCount(),
       apnsConfigured: apnsClient.isConfigured(),
     };
   }
 
-  function pruneDeliveredDedupeKeys() {
-    let didChange = false;
+  async function pruneDeliveredDedupeKeys() {
     const cutoff = now() - PUSH_DEDUPE_TTL_MS;
-    for (const [key, timestamp] of deliveredDedupeKeys.entries()) {
-      if (timestamp < cutoff) {
-        deliveredDedupeKeys.delete(key);
-        didChange = true;
-      }
-    }
-    return didChange;
+    await stateStore.deleteDedupeKeysBefore(cutoff);
   }
 
-  function pruneSessions() {
-    let didChange = false;
+  async function pruneSessions() {
     const cutoff = now() - PUSH_SESSION_TTL_MS;
-    for (const [sessionId, session] of sessions.entries()) {
-      if (Number(session?.updatedAt || 0) < cutoff) {
-        sessions.delete(sessionId);
-        didChange = true;
-      }
-    }
-    return didChange;
+    await stateStore.deleteSessionsBefore(cutoff);
   }
 
-  function pruneStaleState() {
-    if (pruneDeliveredDedupeKeys() || pruneSessions()) {
-      persistState("pruneStaleState");
-    }
-  }
-
-  // Keeps live registrations usable even if the optional state file cannot be updated.
-  function persistState(reason) {
-    try {
-      stateStore.write({
-        sessions: [...sessions.entries()],
-        deliveredDedupeKeys: [...deliveredDedupeKeys.entries()],
-      });
-    } catch (error) {
-      console.error(
-        `${logPrefix} push state persistence failed during ${reason}: ${error.message}`
-      );
-    }
+  async function pruneStaleState() {
+    await pruneDeliveredDedupeKeys();
+    await pruneSessions();
   }
 
   return {
@@ -205,90 +158,59 @@ function createPushSessionService({
   };
 }
 
-function createFileBackedPushStateStore({ stateFilePath } = {}) {
-  const resolvedPath = typeof stateFilePath === "string" && stateFilePath.trim()
-    ? stateFilePath.trim()
-    : "";
-
+export function createDurableObjectPushStateStore(storage) {
   return {
-    read() {
-      if (!resolvedPath || !fs.existsSync(resolvedPath)) {
-        return emptyPushState();
-      }
-
-      const parsed = safeParseJSON(fs.readFileSync(resolvedPath, "utf8"));
-      if (!parsed || typeof parsed !== "object") {
-        return emptyPushState();
-      }
-
-      return {
-        sessions: normalizeEntryList(parsed.sessions),
-        deliveredDedupeKeys: normalizeEntryList(parsed.deliveredDedupeKeys),
-      };
+    async getSession(sessionId) {
+      return storage.get(sessionKey(sessionId));
     },
-    write(state) {
-      if (!resolvedPath) {
-        return;
+    async setSession(sessionId, session) {
+      await storage.put(sessionKey(sessionId), session);
+    },
+    async getDedupeKey(dedupeKey) {
+      return storage.get(dedupeKeyName(dedupeKey));
+    },
+    async setDedupeKey(dedupeKey, timestamp) {
+      await storage.put(dedupeKeyName(dedupeKey), timestamp);
+    },
+    async sessionCount() {
+      return (await storage.list({ prefix: "push:session:" })).size;
+    },
+    async dedupeKeyCount() {
+      return (await storage.list({ prefix: "push:dedupe:" })).size;
+    },
+    async deleteDedupeKeysBefore(cutoff) {
+      const entries = await storage.list({ prefix: "push:dedupe:" });
+      const deletes = [];
+      for (const [key, timestamp] of entries) {
+        if (Number(timestamp || 0) < cutoff) {
+          deletes.push(key);
+        }
       }
-
-      const normalizedState = {
-        sessions: normalizeEntryList(state?.sessions),
-        deliveredDedupeKeys: normalizeEntryList(state?.deliveredDedupeKeys),
-      };
-      fs.mkdirSync(path.dirname(resolvedPath), { recursive: true });
-      const tempPath = `${resolvedPath}.tmp`;
-      fs.writeFileSync(tempPath, JSON.stringify(normalizedState), {
-        encoding: "utf8",
-        mode: 0o600,
-      });
-      fs.renameSync(tempPath, resolvedPath);
-      try {
-        fs.chmodSync(resolvedPath, 0o600);
-      } catch {
-        // Best-effort only on filesystems that support POSIX modes.
+      if (deletes.length > 0) {
+        await storage.delete(deletes);
+      }
+    },
+    async deleteSessionsBefore(cutoff) {
+      const entries = await storage.list({ prefix: "push:session:" });
+      const deletes = [];
+      for (const [key, session] of entries) {
+        if (Number(session?.updatedAt || 0) < cutoff) {
+          deletes.push(key);
+        }
+      }
+      if (deletes.length > 0) {
+        await storage.delete(deletes);
       }
     },
   };
 }
 
-function apnsConfigFromEnv(env) {
-  return {
-    teamId: readFirstDefinedEnv(["REMODEX_APNS_TEAM_ID", "PHODEX_APNS_TEAM_ID"], env),
-    keyId: readFirstDefinedEnv(["REMODEX_APNS_KEY_ID", "PHODEX_APNS_KEY_ID"], env),
-    bundleId: readFirstDefinedEnv(["REMODEX_APNS_BUNDLE_ID", "PHODEX_APNS_BUNDLE_ID"], env),
-    privateKey: readAPNsPrivateKey(env),
-  };
+function sessionKey(sessionId) {
+  return `push:session:${sessionId}`;
 }
 
-function readAPNsPrivateKey(env) {
-  const rawValue = readFirstDefinedEnv(["REMODEX_APNS_PRIVATE_KEY", "PHODEX_APNS_PRIVATE_KEY"], env);
-  if (rawValue) {
-    return rawValue;
-  }
-
-  const filePath = readFirstDefinedEnv(
-    ["REMODEX_APNS_PRIVATE_KEY_FILE", "PHODEX_APNS_PRIVATE_KEY_FILE"],
-    env
-  );
-  if (!filePath) {
-    return "";
-  }
-
-  try {
-    return fs.readFileSync(filePath, "utf8");
-  } catch {
-    return "";
-  }
-}
-
-function readFirstDefinedEnv(keys, env) {
-  for (const key of keys) {
-    const value = readString(env?.[key]);
-    if (value) {
-      return value;
-    }
-  }
-  return "";
+function dedupeKeyName(dedupeKey) {
+  return `push:dedupe:${dedupeKey}`;
 }
 
 function normalizeDeviceToken(value) {
@@ -307,66 +229,12 @@ function normalizePreviewText(value) {
   }
 
   return normalized.length > PUSH_PREVIEW_MAX_CHARS
-    ? `${normalized.slice(0, PUSH_PREVIEW_MAX_CHARS - 1).trimEnd()}…`
+    ? `${normalized.slice(0, PUSH_PREVIEW_MAX_CHARS - 1).trimEnd()}...`
     : normalized;
 }
 
 function fallbackBodyForResult(result) {
   return result === "failed" ? "Run failed" : "Response ready";
-}
-
-function resolvePushStateFilePath(env = process.env) {
-  const explicitPath = readFirstDefinedEnv(
-    ["REMODEX_PUSH_STATE_FILE", "PHODEX_PUSH_STATE_FILE"],
-    env
-  );
-  if (explicitPath) {
-    return explicitPath;
-  }
-
-  const codexHome = readString(env.CODEX_HOME) || path.join(os.homedir(), ".codex");
-  return path.join(codexHome, "remodex", "push-state.json");
-}
-
-function normalizeEntryList(value) {
-  if (!Array.isArray(value)) {
-    return [];
-  }
-
-  return value.filter((entry) => Array.isArray(entry) && entry.length === 2);
-}
-
-function emptyPushState() {
-  return {
-    sessions: [],
-    deliveredDedupeKeys: [],
-  };
-}
-
-function safeParseJSON(value) {
-  if (!value || typeof value !== "string") {
-    return null;
-  }
-
-  try {
-    return JSON.parse(value);
-  } catch {
-    return null;
-  }
-}
-
-function secretsEqual(left, right) {
-  const leftBuffer = Buffer.from(readString(left));
-  const rightBuffer = Buffer.from(readString(right));
-  if (!leftBuffer.length || leftBuffer.length !== rightBuffer.length) {
-    return false;
-  }
-
-  return crypto.timingSafeEqual(leftBuffer, rightBuffer);
-}
-
-function readString(value) {
-  return typeof value === "string" && value.trim() ? value.trim() : "";
 }
 
 function pushServiceError(code, message, status) {
@@ -375,9 +243,3 @@ function pushServiceError(code, message, status) {
   error.status = status;
   return error;
 }
-
-module.exports = {
-  createPushSessionService,
-  createFileBackedPushStateStore,
-  resolvePushStateFilePath,
-};
