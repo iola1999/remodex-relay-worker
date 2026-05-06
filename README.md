@@ -9,3 +9,5 @@ The original relay code and protocol notes live in the Remodex repository:
 https://github.com/Emanuele-web04/remodex/tree/main/relay
 
 This version keeps the relay behavior but adapts the runtime to Cloudflare Workers and Durable Objects.
+
+Implementation notes: [docs/ADAPTATION.md](docs/ADAPTATION.md)
